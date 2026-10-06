@@ -46,6 +46,7 @@ function auth(req,res,next){const s=session(req);if(!s)return res.status(401).js
 function fail(message){const e=new Error(message);e.status=400;throw e;}
 function str(v,max=500){return String(v??'').trim().slice(0,max);}
 function integer(v,min=0,max=100000000){const n=Number(v);if(!Number.isSafeInteger(n)||n<min||n>max)fail('قيمة رقمية غير صحيحة');return n;}
+function normalizePhone(value){return value.replace(/[٠-٩۰-۹]/g,digit=>String(digit.charCodeAt(0)-(digit<='٩'?0x0660:0x06f0)));}
 function imagePath(v){return typeof v==='string'&&/^\/uploads\/[a-f0-9]+\.(png|jpg|webp)$/.test(v);}
 const product = r => {
  const {sale_mode, quantity_offers, ...fields} = r;
@@ -127,6 +128,7 @@ app.put('/api/admin/settings',(req,res)=>{
 });
 app.post('/api/orders',rateLimit({windowMs:60*1000,limit:10,standardHeaders:true,legacyHeaders:false}),(req,res)=>{
  const b=req.body,s=settings(),c={};for(const key of ['name','phone','province','area','address','notes'])c[key]=str(b[key],key==='notes'?1000:300);
+ c.phone=normalizePhone(c.phone);
  if(!c.name||!/^\+?[0-9]{10,15}$/.test(c.phone)||!c.province||!c.address||(s.areaRequired&&!c.area))fail('أكمل معلومات الطلب ورقم الهاتف بشكل صحيح');
  const provinces=['بغداد','البصرة','نينوى','أربيل','النجف','كربلاء','بابل','الأنبار','ديالى','كركوك','السليمانية','دهوك','واسط','ميسان','ذي قار','المثنى','القادسية','صلاح الدين'];if(!provinces.includes(c.province))fail('المحافظة غير صحيحة');
  if(!s.notesEnabled)c.notes='';if(!Array.isArray(b.items)||!b.items.length||b.items.length>100)fail('السلة فارغة أو غير صحيحة');

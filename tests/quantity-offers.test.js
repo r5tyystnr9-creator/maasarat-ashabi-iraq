@@ -33,11 +33,11 @@ test('safe migration and authoritative offer pricing, mixed shipping, stock and 
  const old=(await f.request('/admin/orders')).body[0];assert.equal(old.total,18000);assert.equal(old.items[0].price,15000);
  const creation=await f.request('/admin/products','POST',{...ordinary,saleMode:'offers',quantityOffers:offers});assert.equal(creation.status,201);const id=creation.body.id;
  let p=(await f.request('/store')).body.products.find(p=>p.id===id);const [paid,free,large]=p.quantityOffers;assert.notEqual(paid.id,free.id);
- const order=items=>f.request('/orders','POST',{...customer,total:1,delivery:0,items});
- let result=await order([{id:1,quantity:2}]);assert.equal(result.status,201);assert.equal(result.body.total,33000);assert.equal((await f.request('/store')).body.products.find(p=>p.id===1).stock,28);
- result=await order([{id,offerId:paid.id,quantity:3,totalPrice:1,price:1,deliveryFee:0,freeDelivery:true,offer:{...paid,totalPrice:1}}]);assert.equal(result.status,201);assert.equal(result.body.subtotal,35000);assert.equal(result.body.delivery,5000);assert.equal(result.body.total,40000);
- let snapshot=(await f.request('/admin/orders')).body.find(o=>o.id===result.body.id).items[0];assert.equal(snapshot.quantity,3);assert.deepEqual(snapshot.offer,paid);assert.equal(snapshot.offerDescription,'3 قطعة — الأكثر طلبًا');
- result=await order([{id,offerId:free.id,quantity:3}]);assert.equal(result.status,201);assert.equal(result.body.delivery,0);assert.equal(result.body.total,33000);
+ const order=(items,phone=customer.phone)=>f.request('/orders','POST',{...customer,phone,total:1,delivery:0,items});
+ let result=await order([{id:1,quantity:2}],'٠٧٧٠١٢٣٤٥٦٧');assert.equal(result.status,201);assert.equal(result.body.total,33000);assert.equal((await f.request('/store')).body.products.find(p=>p.id===1).stock,28);
+ result=await order([{id,offerId:paid.id,quantity:3,totalPrice:1,price:1,deliveryFee:0,freeDelivery:true,offer:{...paid,totalPrice:1}}],'٠77٠١2٣٤5٦7');assert.equal(result.status,201);assert.equal(result.body.subtotal,35000);assert.equal(result.body.delivery,5000);assert.equal(result.body.total,40000);
+ const savedOrder=(await f.request('/admin/orders')).body.find(o=>o.id===result.body.id);assert.equal(savedOrder.customer.phone,'07701234567');let snapshot=savedOrder.items[0];assert.equal(snapshot.quantity,3);assert.deepEqual(snapshot.offer,paid);assert.equal(snapshot.offerDescription,'3 قطعة — الأكثر طلبًا');
+ result=await order([{id,offerId:free.id,quantity:3}],'۰۷۷۰۱۲۳۴۵۶۷');assert.equal(result.status,201);assert.equal(result.body.delivery,0);assert.equal(result.body.total,33000);
  result=await order([{id:1,quantity:1},{id,offerId:free.id,quantity:3}]);assert.equal(result.status,201);assert.equal(result.body.delivery,3000);assert.equal(result.body.total,51000);
  // Invalid submissions must not deduct either product's stock, including a partially processed cart.
  const before=(await f.request('/store')).body.products;
