@@ -107,6 +107,7 @@ app.delete('/api/admin/products/:id',(req,res)=>{db.prepare('DELETE FROM product
 const upload=multer({dest:path.join(data,'uploads'),limits:{fileSize:5*1024*1024,files:10}});
 app.post('/api/admin/uploads',upload.array('images',10),(req,res)=>{
  const paths=[];
+ if(!req.files?.length)fail('اختر صورة للرفع');
  try { for(const f of req.files||[]){const bytes=readFileSync(f.path);const ext=bytes.subarray(0,8).equals(Buffer.from([137,80,78,71,13,10,26,10]))?'png':bytes[0]===255&&bytes[1]===216&&bytes[2]===255?'jpg':bytes.toString('ascii',0,4)==='RIFF'&&bytes.toString('ascii',8,12)==='WEBP'?'webp':null;if(!ext)fail('يسمح بصور PNG وJPEG وWebP فقط');paths.push({file:f,path:'/uploads/'+f.filename+'.'+ext});}
  for(const f of paths)renameSync(f.file.path,path.join(data,f.path));
  }catch(e){for(const f of req.files||[])try{unlinkSync(f.path);}catch{};throw e;}
@@ -170,5 +171,10 @@ app.post('/api/orders',rateLimit({windowMs:60*1000,limit:10,standardHeaders:true
 app.use('/uploads',express.static(path.join(data,'uploads'),{dotfiles:'deny',setHeaders:res=>res.set('Cache-Control','public, max-age=86400')}));
 app.use(express.static('public'));
 app.get(['/admin','/products','/product/:id','/cart','/checkout'],(_req,res)=>res.sendFile(path.resolve('public/index.html')));
-app.use((err,req,res,next)=>{console.error(err.message);res.status(err.status|| (err instanceof multer.MulterError?400:500)).json({error:err.status||err instanceof multer.MulterError?err.message:'حدث خطأ في الخادم'});});
+app.use((err,req,res,next)=>{
+ console.error(err.message);
+ const uploadErrors={LIMIT_FILE_SIZE:'حجم الصورة أكبر من 5MB',LIMIT_FILE_COUNT:'الحد الأقصى 10 صور',LIMIT_UNEXPECTED_FILE:'ملف غير متوقع أو أكثر من 10 صور'};
+ const isUpload=err instanceof multer.MulterError;
+ res.status(err.status||(isUpload?400:500)).json({error:isUpload?(uploadErrors[err.code]||'تعذر رفع الصورة'):err.status?err.message:'حدث خطأ في الخادم'});
+});
 app.listen(Number(process.env.PORT||3000),'0.0.0.0',()=>console.log('Store server started'));
