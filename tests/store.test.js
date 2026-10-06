@@ -1,0 +1,43 @@
+import {test} from 'node:test';
+import assert from 'node:assert/strict';
+import {spawn} from 'node:child_process';
+import {mkdtempSync,rmSync} from 'node:fs';
+import {tmpdir} from 'node:os';
+import path from 'node:path';
+import {randomBytes} from 'node:crypto';
+import {chromium} from '@playwright/test';
+
+test('real browser store/admin lifecycle, persistence, security and mobile layout',async()=>{
+ const dir=mkdtempSync(path.join(tmpdir(),'store-test-')),password=randomBytes(24).toString('hex');
+ const port=3100+Math.floor(Math.random()*1000),base='http://127.0.0.1:'+port;let proc,browser;
+ const start=async()=>{proc=spawn(process.execPath,['server.js'],{env:{...process.env,PORT:String(port),DATA_DIR:dir,ADMIN_USERNAME:'test-admin',ADMIN_PASSWORD:password},stdio:'pipe'});let err='';proc.stderr.on('data',d=>err+=d);for(let i=0;i<100;i++){if(proc.exitCode!==null)throw new Error(err);try{if((await fetch(base+'/api/health')).ok)return;}catch{}await new Promise(r=>setTimeout(r,100));}throw new Error('Startup timed out '+err);};
+ const stop=async()=>{if(proc&&proc.exitCode===null){const p=new Promise(r=>proc.once('exit',r));proc.kill();await p;}};
+ try{
+ await start();assert.equal((await fetch(base+'/api/admin/orders')).status,401);
+ const initial=await (await fetch(base+'/api/store')).json();assert.equal(initial.products.length,0);
+ browser=await chromium.launch({executablePath:process.env.CHROMIUM_PATH||'/usr/bin/chromium',headless:true,args:['--no-sandbox']});
+ const admin=await browser.newPage(),errors=[];admin.on('pageerror',err=>errors.push(err.message));
+ await admin.goto(base+'/admin');await admin.locator('[name=username]').fill('test-admin');await admin.locator('[name=password]').fill(password);await admin.getByRole('button',{name:'تسجيل الدخول',exact:true}).click();await admin.locator('.stats').first().waitFor();
+ await admin.locator('[data-tab=categories]').click();await admin.locator('[name=name]').fill('قسم الاختبار');await admin.getByRole('button',{name:'+ إضافة قسم'}).click();await admin.getByText('قسم الاختبار',{exact:true}).waitFor();
+ await admin.locator('[data-tab=products]').click();await admin.locator('#newproduct').click();await admin.locator('[name=name]').fill('منتج اختبار مؤقت');await admin.locator('[name=price]').fill('15000');await admin.locator('[name=stock]').fill('10');await admin.locator('[name=description]').fill('وصف حقيقي محفوظ في قاعدة البيانات للاختبار');await admin.locator('[name=category_id]').selectOption({label:'قسم الاختبار'});await admin.locator('[name=featured]').check();
+ const png=Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=','base64');
+ await admin.locator('#productimages').setInputFiles([{name:'one.png',mimeType:'image/png',buffer:png},{name:'two.png',mimeType:'image/png',buffer:png}]);await admin.locator('#imagesedit img').nth(1).waitFor();await admin.getByRole('button',{name:'حفظ المنتج',exact:true}).click();await admin.locator('[data-edit]').waitFor();
+ const storefront=await browser.newPage({viewport:{width:390,height:844}});storefront.on('pageerror',err=>errors.push(err.message));await storefront.goto(base);await storefront.getByRole('heading',{name:'منتج اختبار مؤقت'}).waitFor();await storefront.screenshot({path:'/tmp/maasarat-mobile.png',fullPage:true});assert.equal(await storefront.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
+ await storefront.getByRole('heading',{name:'منتج اختبار مؤقت'}).click();await storefront.locator('#detailqty').fill('2');await storefront.getByRole('button',{name:'أضف إلى السلة',exact:true}).click();await storefront.getByRole('link',{name:/السلة/}).click();await storefront.locator('[data-quantity][data-delta="1"]').click();await storefront.getByRole('link',{name:'إتمام الطلب ←'}).click();await storefront.locator('[name=name]').fill('عميل اختبار');await storefront.locator('[name=phone]').fill('07701234567');await storefront.locator('[name=province]').selectOption('بغداد');await storefront.locator('[name=area]').fill('الكرادة');await storefront.locator('[name=address]').fill('عنوان اختبار فقط');await storefront.locator('[name=notes]').fill('ملاحظة الاختبار');await storefront.getByRole('button',{name:'تأكيد الطلب',exact:true}).click();await storefront.getByRole('heading',{name:'تم استلام طلبك'}).waitFor();
+ await admin.locator('[data-tab=orders]').click();await admin.getByRole('button',{name:'فتح الطلب',exact:true}).click();await admin.getByText('ملاحظة الاختبار',{exact:true}).waitFor();await admin.locator('#changestatus').selectOption('قيد التجهيز');await admin.waitForFunction(()=>document.querySelector('#ordertable')?.textContent.includes('قيد التجهيز'));
+ const cookies=await admin.context().cookies(),cookie=cookies.map(c=>`${c.name}=${c.value}`).join(';');const session=await (await fetch(base+'/api/admin/session',{headers:{cookie}})).json();
+ const request=async(url,method,body)=>fetch(base+'/api'+url,{method,headers:{cookie,'Content-Type':'application/json','x-csrf-token':session.csrf},body:JSON.stringify(body)});
+ const os=await (await fetch(base+'/api/admin/orders',{headers:{cookie}})).json();assert.equal(os.length,1);assert.equal(os[0].total,48000);assert.equal(os[0].items[0].quantity,3);assert.equal(os[0].status,'قيد التجهيز');
+ let ps=await (await fetch(base+'/api/store')).json();assert.equal(ps.products[0].stock,7);assert.equal(ps.products[0].images.length,2);assert.equal((await fetch(base+ps.products[0].images[0])).status,200);
+ const forbidden=await fetch(base+'/api/admin/products',{method:'POST',headers:{cookie,'Content-Type':'application/json'},body:JSON.stringify({name:'forbidden'})});assert.equal(forbidden.status,403);
+ const oversell=await request('/orders','POST',{name:'عميل',phone:'07701234567',province:'بغداد',area:'منطقة',address:'عنوان',items:[{id:ps.products[0].id,quantity:99}]});assert.equal(oversell.status,400);
+ const tamper=await request('/orders','POST',{name:'عميل',phone:'07701234567',province:'بغداد',area:'منطقة',address:'عنوان',total:1,items:[{id:ps.products[0].id,quantity:1,price:1}]});assert.equal(tamper.status,201);assert.equal((await tamper.json()).total,18000);
+ await request('/admin/settings','PUT',{primary:'#236c40',whatsapp:'9647701234567',deliveryByProvince:{بغداد:5000}});await storefront.goto(base);await storefront.getByRole('link',{name:'واتساب ↗'}).waitFor();assert.equal(await storefront.evaluate(()=>getComputedStyle(document.documentElement).getPropertyValue('--primary').trim()),'#236c40');
+ await admin.locator('[data-tab=products]').click();await admin.locator('[data-edit]').click();await admin.locator('[name=price]').fill('17000');await admin.getByRole('button',{name:'حفظ المنتج',exact:true}).click();await admin.locator('[data-edit]').waitFor();await storefront.goto(base+'/products');assert.match(await storefront.locator('.price').textContent(),/١٧/);
+ await storefront.locator('#search').fill('غير موجود');await storefront.getByRole('heading',{name:'لا توجد منتجات مطابقة'}).waitFor();
+ for(const viewport of [{width:390,height:844},{width:1440,height:900}]){await storefront.setViewportSize(viewport);await storefront.goto(base+'/products');assert.equal(await storefront.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);await admin.setViewportSize(viewport);assert.equal(await admin.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);}
+ assert.deepEqual(errors,[]);
+ await stop();await start();ps=await (await fetch(base+'/api/store')).json();assert.equal(ps.products[0].price,17000);assert.equal(ps.settings.deliveryByProvince['بغداد'],5000);assert.equal((await (await fetch(base+'/api/admin/orders',{headers:{cookie}})).json()).length,2);
+ await request('/admin/products/'+ps.products[0].id,'DELETE');assert.equal((await (await fetch(base+'/api/store')).json()).products.length,0);assert.equal((await (await fetch(base+'/api/admin/orders',{headers:{cookie}})).json())[0].items[0].name,'منتج اختبار مؤقت');
+ }finally{if(browser)await browser.close();await stop();rmSync(dir,{recursive:true,force:true});}
+});
