@@ -21,6 +21,14 @@ CREATE TABLE IF NOT EXISTS products(id INTEGER PRIMARY KEY,name TEXT NOT NULL,de
 CREATE TABLE IF NOT EXISTS settings(id INTEGER PRIMARY KEY CHECK(id=1),value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS orders(id INTEGER PRIMARY KEY,created_at TEXT,customer TEXT,items TEXT,subtotal INTEGER,delivery INTEGER,total INTEGER,status TEXT);
 `);
+// Additive, transactional migration: existing products remain ordinary sales.
+db.exec('BEGIN IMMEDIATE');
+try {
+ const columns = new Set(db.prepare('PRAGMA table_info(products)').all().map(c => c.name));
+ if (!columns.has('sale_mode')) db.exec("ALTER TABLE products ADD COLUMN sale_mode TEXT NOT NULL DEFAULT 'normal'");
+ if (!columns.has('quantity_offers')) db.exec("ALTER TABLE products ADD COLUMN quantity_offers TEXT NOT NULL DEFAULT '[]'");
+ db.exec('COMMIT');
+} catch (error) { db.exec('ROLLBACK'); throw error; }
 const defaults = {name:'مسارات أعشاب العراق',description:'منتجات طبيعية لحياة أفضل',address:'',phone:'',email:'',whatsapp:'',whatsappMessage:'مرحبًا، أريد الاستفسار عن منتجاتكم',whatsappEnabled:true,phoneEnabled:true,logo:'',primary:'#168345',background:'#f6f8f5',text:'#20372a',font:'sans-serif',radius:14,heroTitle:'من الطبيعة… إلى بيتك',heroText:'اكتشف منتجاتنا واختر ما يناسبك بكل سهولة',heroImage:'',delivery:3000,deliveryByProvince:{},notesEnabled:true,areaRequired:true};
 if (!db.prepare('SELECT id FROM settings WHERE id=1').get()) db.prepare('INSERT INTO settings VALUES(1,?)').run(JSON.stringify(defaults));
 const settings = () => ({...defaults,...JSON.parse(db.prepare('SELECT value FROM settings WHERE id=1').get().value)});
@@ -39,7 +47,10 @@ function fail(message){const e=new Error(message);e.status=400;throw e;}
 function str(v,max=500){return String(v??'').trim().slice(0,max);}
 function integer(v,min=0,max=100000000){const n=Number(v);if(!Number.isSafeInteger(n)||n<min||n>max)fail('قيمة رقمية غير صحيحة');return n;}
 function imagePath(v){return typeof v==='string'&&/^\/uploads\/[a-f0-9]+\.(png|jpg|webp)$/.test(v);}
-const product = r => ({...r,images:JSON.parse(r.images)});
+const product = r => {
+ const {sale_mode, quantity_offers, ...fields} = r;
+ return {...fields, images:JSON.parse(r.images), saleMode:sale_mode || 'normal', quantityOffers:JSON.parse(quantity_offers || '[]')};
+};
 app.get('/api/health',(_req,res)=>{db.prepare('SELECT 1').get();res.json({ok:true});});
 app.get('/api/store',(_req,res)=>res.json({settings:settings(),categories:db.prepare('SELECT * FROM categories ORDER BY id').all(),products:db.prepare('SELECT * FROM products ORDER BY id DESC').all().map(product)}));
 app.post('/api/login',rateLimit({windowMs:15*60*1000,limit:10,standardHeaders:true,legacyHeaders:false}),async(req,res)=>{
@@ -58,9 +69,40 @@ app.patch('/api/admin/orders/:id',(req,res)=>{if(!['جديد','قيد التجه
 app.post('/api/admin/categories',(req,res)=>{const name=str(req.body.name,100);if(!name)fail('اسم القسم مطلوب');const r=db.prepare('INSERT INTO categories(name) VALUES(?)').run(name);res.status(201).json({id:Number(r.lastInsertRowid)});});
 app.put('/api/admin/categories/:id',(req,res)=>{const name=str(req.body.name,100);if(!name)fail('اسم القسم مطلوب');db.prepare('UPDATE categories SET name=? WHERE id=?').run(name,integer(req.params.id,1));res.json({ok:true});});
 app.delete('/api/admin/categories/:id',(req,res)=>{db.prepare('DELETE FROM categories WHERE id=?').run(integer(req.params.id,1));res.json({ok:true});});
-function productBody(b){const name=str(b.name,200);if(!name)fail('اسم المنتج مطلوب');const images=Array.isArray(b.images)?b.images:[];if(images.length>10||images.some(v=>!imagePath(v)))fail('صور غير صحيحة');const category=b.category_id?integer(b.category_id,1):null;if(category&&!db.prepare('SELECT id FROM categories WHERE id=?').get(category))fail('القسم غير موجود');return [name,str(b.description,10000),integer(b.price),integer(b.stock),category,JSON.stringify(images),b.featured?1:0];}
-app.post('/api/admin/products',(req,res)=>{const r=db.prepare('INSERT INTO products(name,description,price,stock,category_id,images,featured) VALUES(?,?,?,?,?,?,?)').run(...productBody(req.body));res.status(201).json({id:Number(r.lastInsertRowid)});});
-app.put('/api/admin/products/:id',(req,res)=>{const r=db.prepare('UPDATE products SET name=?,description=?,price=?,stock=?,category_id=?,images=?,featured=? WHERE id=?').run(...productBody(req.body),integer(req.params.id,1));if(!r.changes)return res.status(404).json({error:'المنتج غير موجود'});res.json({ok:true});});
+function normalizeOffers(value) {
+ if (!Array.isArray(value) || value.length > 20) fail('يسمح بإضافة 20 عرضًا كحد أقصى');
+ const ids = new Set();
+ return value.map(offer => {
+  if (!offer || typeof offer !== 'object') fail('عرض غير صحيح');
+  const id = offer.id ?? randomBytes(12).toString('hex');
+  if (typeof id !== 'string' || !/^[a-f0-9]{16,64}$/.test(id) || ids.has(id)) fail('معرف العرض غير صحيح أو مكرر');
+  ids.add(id);
+  if (offer.freeDelivery !== undefined && typeof offer.freeDelivery !== 'boolean') fail('خيار التوصيل المجاني غير صحيح');
+  return {id, quantity:integer(offer.quantity,1,999), totalPrice:integer(offer.totalPrice), deliveryFee:integer(offer.deliveryFee), freeDelivery:offer.freeDelivery === true, badgeText:str(offer.badgeText,80)};
+ });
+}
+function productBody(b, existing = null) {
+ const name=str(b.name,200);if(!name)fail('اسم المنتج مطلوب');
+ const images=Array.isArray(b.images)?b.images:[];
+ if(images.length>10||images.some(v=>!imagePath(v)))fail('صور غير صحيحة');
+ const category=b.category_id?integer(b.category_id,1):null;
+ if(category&&!db.prepare('SELECT id FROM categories WHERE id=?').get(category))fail('القسم غير موجود');
+ const saleMode=b.saleMode ?? existing?.saleMode ?? 'normal';
+ if(!['normal','offers'].includes(saleMode))fail('طريقة البيع غير صحيحة');
+ const offers=normalizeOffers(b.quantityOffers ?? existing?.quantityOffers ?? []);
+ if(saleMode==='offers'&&!offers.length)fail('أضف عرضًا واحدًا على الأقل');
+ return [name,str(b.description,10000),integer(b.price),integer(b.stock),category,JSON.stringify(images),b.featured?1:0,saleMode,JSON.stringify(offers)];
+}
+app.post('/api/admin/products',(req,res)=>{
+ const r=db.prepare('INSERT INTO products(name,description,price,stock,category_id,images,featured,sale_mode,quantity_offers) VALUES(?,?,?,?,?,?,?,?,?)').run(...productBody(req.body));
+ res.status(201).json({id:Number(r.lastInsertRowid)});
+});
+app.put('/api/admin/products/:id',(req,res)=>{
+ const id=integer(req.params.id,1),existing=db.prepare('SELECT * FROM products WHERE id=?').get(id);
+ if(!existing)return res.status(404).json({error:'المنتج غير موجود'});
+ db.prepare('UPDATE products SET name=?,description=?,price=?,stock=?,category_id=?,images=?,featured=?,sale_mode=?,quantity_offers=? WHERE id=?').run(...productBody(req.body,product(existing)),id);
+ res.json({ok:true});
+});
 app.delete('/api/admin/products/:id',(req,res)=>{db.prepare('DELETE FROM products WHERE id=?').run(integer(req.params.id,1));res.json({ok:true});});
 const upload=multer({dest:path.join(data,'uploads'),limits:{fileSize:5*1024*1024,files:10}});
 app.post('/api/admin/uploads',upload.array('images',10),(req,res)=>{
@@ -88,9 +130,40 @@ app.post('/api/orders',rateLimit({windowMs:60*1000,limit:10,standardHeaders:true
  const provinces=['بغداد','البصرة','نينوى','أربيل','النجف','كربلاء','بابل','الأنبار','ديالى','كركوك','السليمانية','دهوك','واسط','ميسان','ذي قار','المثنى','القادسية','صلاح الدين'];if(!provinces.includes(c.province))fail('المحافظة غير صحيحة');
  if(!s.notesEnabled)c.notes='';if(!Array.isArray(b.items)||!b.items.length||b.items.length>100)fail('السلة فارغة أو غير صحيحة');
  db.exec('BEGIN IMMEDIATE');try{
- const quantities=new Map();for(const item of b.items){const id=integer(item.id,1),q=integer(item.quantity,1,999);quantities.set(id,(quantities.get(id)||0)+q);}
- const items=[];let subtotal=0;for(const [id,quantity]of quantities){const p=db.prepare('SELECT * FROM products WHERE id=?').get(id);if(!p||quantity>p.stock)fail('منتج غير متوفر أو الكمية أكبر من المخزون');items.push({id,name:p.name,price:p.price,quantity});subtotal+=p.price*quantity;db.prepare('UPDATE products SET stock=stock-? WHERE id=?').run(quantity,id);}
- const delivery=s.deliveryByProvince[c.province]??s.delivery,total=subtotal+delivery;
+ const normalQuantities=new Map(), offerLines=[], seenOffers=new Set();
+ for(const line of b.items){
+  if(!line||typeof line!=='object')fail('بند طلب غير صحيح');
+  const id=integer(line.id,1),row=db.prepare('SELECT * FROM products WHERE id=?').get(id);
+  if(!row)fail('منتج غير متوفر');
+  const p=product(row);
+  if(p.saleMode==='offers'){
+   const offer=p.quantityOffers.find(o=>o.id===line.offerId);
+   if(!offer)fail('العرض غير موجود أو تغير؛ أعد اختيار العرض');
+   // One selected offer per product; never interpret quantity as a bundle multiplier.
+   if(seenOffers.has(id))fail('اختر عرضًا واحدًا فقط لكل منتج');
+   seenOffers.add(id);
+   if(line.quantity!==undefined&&integer(line.quantity,1,999)!==offer.quantity)fail('كمية العرض تغيرت؛ أعد اختيار العرض');
+   offerLines.push({id,name:p.name,saleMode:'offers',quantity:offer.quantity,totalPrice:offer.totalPrice,deliveryFee:offer.freeDelivery?0:offer.deliveryFee,offerId:offer.id,offer:{...offer},offerDescription:offer.quantity+' قطعة'+(offer.badgeText?' — '+offer.badgeText:'')});
+  }else{
+   if(line.offerId)fail('طريقة بيع المنتج تغيرت؛ أعد إضافته إلى السلة');
+   const q=integer(line.quantity,1,999);normalQuantities.set(id,(normalQuantities.get(id)||0)+q);
+  }
+ }
+ const items=[];let subtotal=0;
+ for(const [id,quantity]of normalQuantities){
+  const p=db.prepare('SELECT * FROM products WHERE id=?').get(id);
+  items.push({id,name:p.name,saleMode:'normal',price:p.price,quantity,totalPrice:p.price*quantity});
+ }
+ items.push(...offerLines);
+ for(const item of items){
+  const p=db.prepare('SELECT stock FROM products WHERE id=?').get(item.id);
+  if(item.quantity>p.stock)fail('منتج غير متوفر أو الكمية أكبر من المخزون');
+  subtotal+=item.totalPrice;
+  db.prepare('UPDATE products SET stock=stock-? WHERE id=?').run(item.quantity,item.id);
+ }
+ // Ordinary shipping is charged once, plus each selected offer's own shipping.
+ const ordinaryDelivery=normalQuantities.size?(s.deliveryByProvince[c.province]??s.delivery):0;
+ const delivery=ordinaryDelivery+offerLines.reduce((sum,item)=>sum+item.deliveryFee,0),total=subtotal+delivery;
  const r=db.prepare('INSERT INTO orders(created_at,customer,items,subtotal,delivery,total,status) VALUES(?,?,?,?,?,?,?)').run(new Date().toISOString(),JSON.stringify(c),JSON.stringify(items),subtotal,delivery,total,'جديد');db.exec('COMMIT');res.status(201).json({id:Number(r.lastInsertRowid),subtotal,delivery,total});
  }catch(e){db.exec('ROLLBACK');throw e;}
 });
